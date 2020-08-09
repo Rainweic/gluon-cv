@@ -23,6 +23,7 @@ from .pspnet import *
 from .quantized import *
 from .residual_attentionnet import *
 from .resnet import *
+from .lresnet import *
 from .resnest import *
 from .resnetv1b import *
 from .resnext import *
@@ -47,6 +48,7 @@ _models = {
     'resnet18_v1': resnet18_v1,
     'resnet34_v1': resnet34_v1,
     'resnet50_v1': resnet50_v1,
+    'lresnet50_v1': lresnet50_v1,
     'resnet101_v1': resnet101_v1,
     'resnet152_v1': resnet152_v1,
     'resnet18_v2': resnet18_v2,
@@ -112,6 +114,7 @@ _models = {
     'ssd_512_resnet18_v1_voc': ssd_512_resnet18_v1_voc,
     'ssd_512_resnet18_v1_coco': ssd_512_resnet18_v1_coco,
     'ssd_512_resnet50_v1_voc': ssd_512_resnet50_v1_voc,
+    'ssd_512_lresnet50_v1_voc': ssd_512_lresnet50_v1_voc,
     'ssd_512_resnet50_v1_coco': ssd_512_resnet50_v1_coco,
     'ssd_512_resnet50_v1_custom': ssd_512_resnet50_v1_custom,
     'ssd_512_resnet101_v2_voc': ssd_512_resnet101_v2_voc,

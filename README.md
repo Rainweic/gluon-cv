@@ -27,16 +27,14 @@ models. This toolkit offers four main features:
 
 现已魔改模型有：
 
-1. resnet50_v1 <br>
+1. lresnet50_v1 <br>
 
     魔改说明: <br>
-        迁移`MobilenetV2`中`的Bottleneck`至`resnet50_v1`中 <br>
-        并同时修改`Bottleneck`中的`ReLU`为`LeakyReLU` 后续修改为`LeakyReLU6` <br>
-        当前版本仅能使用修改后的模型，暂时无法调用原版模型
-        代码示例：`get_model("ssd_512_resnet50_v1_voc")` <br>
+        将`resnet50_v1`中的瓶颈结构中的卷积修改为 深度可分离卷积 <br>
+        代码示例：`get_model("ssd_512_lresnet50_v1_voc")` <br>
         
     使用resnet50为backbone的模型均会涉及，例如SSD, 需要将`pretrained_base`设为`False` <br>
-    代码示例：`get_model("ssd_512_resnet50_v1_voc", pretrained_base=False)` <br>
+    代码示例：`get_model("ssd_512_lresnet50_v1_voc")` <br>
 
 
 ===========================================================================

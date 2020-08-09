@@ -21,16 +21,16 @@
 from __future__ import division
 from mxnet import nd
 
-__all__ = ['ResNetV1', 'ResNetV2',
-           'BasicBlockV1', 'BasicBlockV2',
-           'BottleneckV1', 'BottleneckV2',
-           'resnet18_v1', 'resnet34_v1', 'resnet50_v1', 'resnet101_v1', 'resnet152_v1',
-           'resnet18_v2', 'resnet34_v2', 'resnet50_v2', 'resnet101_v2', 'resnet152_v2',
-           'se_resnet18_v1', 'se_resnet34_v1', 'se_resnet50_v1',
-           'se_resnet101_v1', 'se_resnet152_v1',
-           'se_resnet18_v2', 'se_resnet34_v2', 'se_resnet50_v2',
-           'se_resnet101_v2', 'se_resnet152_v2',
-           'get_resnet']
+__all__ = ['LResNetV1', 'LResNetV2',
+           # 'BasicBlockV1', 'BasicBlockV2',
+           # 'BottleneckV1', 'BottleneckV2',
+           'lresnet18_v1', 'lresnet34_v1', 'lresnet50_v1', 'lresnet101_v1', 'lresnet152_v1',
+           'lresnet18_v2', 'lresnet34_v2', 'lresnet50_v2', 'lresnet101_v2', 'lresnet152_v2',
+           'lse_resnet18_v1', 'lse_resnet34_v1', 'lse_resnet50_v1',
+           'lse_resnet101_v1', 'lse_resnet152_v1',
+           'lse_resnet18_v2', 'lse_resnet34_v2', 'lse_resnet50_v2',
+           'lse_resnet101_v2', 'lse_resnet152_v2',
+           'get_lresnet']
 
 from mxnet.context import cpu
 from mxnet.gluon.block import HybridBlock
@@ -196,6 +196,99 @@ class BottleneckV1(HybridBlock):
         x = F.Activation(x + residual, act_type='relu')
         return x
 
+class LeakyReLU6(HybridBlock):
+    # TODO 将ReLU6与LeakyReLU相结合 暂不知如何写入静态图
+    def __init__(self, alpha):
+        super(LeakyReLU6, self).__init__()
+        num_six = nd.array([6])
+        self.num_six = self.params.get_constant('six', num_six)
+        self.leakyReLU = nn.LeakyReLU(alpha)
+
+    def hybrid_forward(self, F, x, *args, **kwargs):
+        return min(self.leakyReLU(x), self.num_six)
+
+class BottleneckV1WithInvertedResiduals(HybridBlock):
+    r"""
+    This is used for ResNet V1 for 50, 101, 152 layers.
+
+    Parameters
+    ----------
+    channels : int
+        Number of output channels.
+    stride : int
+        Stride size.
+    downsample : bool, default False
+        Whether to downsample the input.
+    in_channels : int, default 0
+        Number of input channels. Default is 0, to infer from the graph.
+    last_gamma : bool, default False
+        Whether to initialize the gamma of the last BatchNorm layer in each bottleneck to zero.
+    use_se : bool, default False
+        Whether to use Squeeze-and-Excitation module
+    norm_layer : object
+        Normalization layer used (default: :class:`mxnet.gluon.nn.BatchNorm`)
+        Can be :class:`mxnet.gluon.nn.BatchNorm` or :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
+    norm_kwargs : dict
+        Additional `norm_layer` arguments, for example `num_devices=4`
+        for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
+    """
+    def __init__(self, channels, stride, downsample=False, in_channels=0,
+                 last_gamma=False, use_se=False, norm_layer=BatchNorm, norm_kwargs=None, **kwargs):
+        super(BottleneckV1WithInvertedResiduals, self).__init__(**kwargs)
+        self.body = nn.HybridSequential(prefix='')
+        # 1x1的卷积先降维
+        up_channels = int(channels//4)
+        self.body.add(nn.Conv2D(up_channels, kernel_size=1, strides=stride))
+        self.body.add(norm_layer(**({} if norm_kwargs is None else norm_kwargs)))
+        self.body.add(nn.LeakyReLU(alpha=0.01))
+        # 3x3的深度分离卷积
+        self.body.add(_conv3x3(up_channels, 1, up_channels, groups=up_channels))
+        self.body.add(norm_layer(**({} if norm_kwargs is None else norm_kwargs)))
+        self.body.add(nn.LeakyReLU(alpha=0.01))
+        # 1x1的卷积升维
+        self.body.add(nn.Conv2D(channels, kernel_size=1, strides=1))
+
+        if use_se:
+            # Resnet50 v1中不使用Squeeze-and-Excitation module 无需考虑
+            self.se = nn.HybridSequential(prefix='')
+            self.se.add(nn.Dense(channels // 16, use_bias=False))
+            self.se.add(nn.Activation('relu'))
+            self.se.add(nn.Dense(channels, use_bias=False))
+            self.se.add(nn.Activation('sigmoid'))
+        else:
+            self.se = None
+
+        if not last_gamma:
+            self.body.add(norm_layer(**({} if norm_kwargs is None else norm_kwargs)))
+        else:
+            self.body.add(norm_layer(gamma_initializer='zeros',
+                                     **({} if norm_kwargs is None else norm_kwargs)))
+
+        if downsample:
+            self.downsample = nn.HybridSequential(prefix='')
+            self.downsample.add(nn.Conv2D(channels, kernel_size=1, strides=stride,
+                                          use_bias=False, in_channels=in_channels))
+            self.downsample.add(norm_layer(**({} if norm_kwargs is None else norm_kwargs)))
+        else:
+            self.downsample = None
+
+    def hybrid_forward(self, F, x):
+        residual = x
+
+        x = self.body(x)
+
+        if self.se:
+            w = F.contrib.AdaptiveAvgPooling2D(x, output_size=1)
+            w = self.se(w)
+            x = F.broadcast_mul(x, w.expand_dims(axis=2).expand_dims(axis=2))
+
+        if self.downsample:
+            residual = self.downsample(residual)
+
+        x = F.Activation(x + residual, act_type='relu')
+        return x
+
+
 class BasicBlockV2(HybridBlock):
     r"""BasicBlock V2 from
     `"Identity Mappings in Deep Residual Networks"
@@ -352,7 +445,7 @@ class BottleneckV2(HybridBlock):
 
 
 # Nets
-class ResNetV1(HybridBlock):
+class LResNetV1(HybridBlock):
     r"""ResNet V1 model from
     `"Deep Residual Learning for Image Recognition"
     <http://arxiv.org/abs/1512.03385>`_ paper.
@@ -382,7 +475,7 @@ class ResNetV1(HybridBlock):
     """
     def __init__(self, block, layers, channels, classes=1000, thumbnail=False,
                  last_gamma=False, use_se=False, norm_layer=BatchNorm, norm_kwargs=None, **kwargs):
-        super(ResNetV1, self).__init__(**kwargs)
+        super(LResNetV1, self).__init__(**kwargs)
         assert len(layers) == len(channels) - 1
         with self.name_scope():
             self.features = nn.HybridSequential(prefix='')
@@ -424,7 +517,7 @@ class ResNetV1(HybridBlock):
         return x
 
 
-class ResNetV2(HybridBlock):
+class LResNetV2(HybridBlock):
     r"""ResNet V2 model from
     `"Identity Mappings in Deep Residual Networks"
     <https://arxiv.org/abs/1603.05027>`_ paper.
@@ -454,7 +547,7 @@ class ResNetV2(HybridBlock):
     """
     def __init__(self, block, layers, channels, classes=1000, thumbnail=False,
                  last_gamma=False, use_se=False, norm_layer=BatchNorm, norm_kwargs=None, **kwargs):
-        super(ResNetV2, self).__init__(**kwargs)
+        super(LResNetV2, self).__init__(**kwargs)
         assert len(layers) == len(channels) - 1
         with self.name_scope():
             self.features = nn.HybridSequential(prefix='')
@@ -509,13 +602,13 @@ resnet_spec = {18: ('basic_block', [2, 2, 2, 2], [64, 64, 128, 256, 512]),
                101: ('bottle_neck', [3, 4, 23, 3], [64, 256, 512, 1024, 2048]),
                152: ('bottle_neck', [3, 8, 36, 3], [64, 256, 512, 1024, 2048])}
 
-resnet_net_versions = [ResNetV1, ResNetV2]
-resnet_block_versions = [{'basic_block': BasicBlockV1, 'bottle_neck': BottleneckV1},
+resnet_net_versions = [LResNetV1, LResNetV2]
+resnet_block_versions = [{'basic_block': BasicBlockV1, 'bottle_neck': BottleneckV1WithInvertedResiduals},
                          {'basic_block': BasicBlockV2, 'bottle_neck': BottleneckV2}]
 
 
 # Constructor
-def get_resnet(version, num_layers, pretrained=False, ctx=cpu(),
+def get_lresnet(version, num_layers, pretrained=False, ctx=cpu(),
                root='~/.mxnet/models', use_se=False, **kwargs):
     r"""ResNet V1 model from `"Deep Residual Learning for Image Recognition"
     <http://arxiv.org/abs/1512.03385>`_ paper.
@@ -568,7 +661,7 @@ def get_resnet(version, num_layers, pretrained=False, ctx=cpu(),
         net.classes_long = attrib.classes_long
     return net
 
-def resnet18_v1(**kwargs):
+def lresnet18_v1(**kwargs):
     r"""ResNet-18 V1 model from `"Deep Residual Learning for Image Recognition"
     <http://arxiv.org/abs/1512.03385>`_ paper.
 
@@ -588,9 +681,9 @@ def resnet18_v1(**kwargs):
         Additional `norm_layer` arguments, for example `num_devices=4`
         for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
     """
-    return get_resnet(1, 18, use_se=False, **kwargs)
+    return get_lresnet(1, 18, use_se=False, **kwargs)
 
-def resnet34_v1(**kwargs):
+def lresnet34_v1(**kwargs):
     r"""ResNet-34 V1 model from `"Deep Residual Learning for Image Recognition"
     <http://arxiv.org/abs/1512.03385>`_ paper.
 
@@ -610,9 +703,9 @@ def resnet34_v1(**kwargs):
         Additional `norm_layer` arguments, for example `num_devices=4`
         for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
     """
-    return get_resnet(1, 34, use_se=False, **kwargs)
+    return get_lresnet(1, 34, use_se=False, **kwargs)
 
-def resnet50_v1(**kwargs):
+def lresnet50_v1(**kwargs):
     r"""ResNet-50 V1 model from `"Deep Residual Learning for Image Recognition"
     <http://arxiv.org/abs/1512.03385>`_ paper.
 
@@ -632,9 +725,9 @@ def resnet50_v1(**kwargs):
         Additional `norm_layer` arguments, for example `num_devices=4`
         for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
     """
-    return get_resnet(1, 50, use_se=False, **kwargs)
+    return get_lresnet(1, 50, use_se=False, **kwargs)
 
-def resnet101_v1(**kwargs):
+def lresnet101_v1(**kwargs):
     r"""ResNet-101 V1 model from `"Deep Residual Learning for Image Recognition"
     <http://arxiv.org/abs/1512.03385>`_ paper.
 
@@ -654,9 +747,9 @@ def resnet101_v1(**kwargs):
         Additional `norm_layer` arguments, for example `num_devices=4`
         for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
     """
-    return get_resnet(1, 101, use_se=False, **kwargs)
+    return get_lresnet(1, 101, use_se=False, **kwargs)
 
-def resnet152_v1(**kwargs):
+def lresnet152_v1(**kwargs):
     r"""ResNet-152 V1 model from `"Deep Residual Learning for Image Recognition"
     <http://arxiv.org/abs/1512.03385>`_ paper.
 
@@ -676,9 +769,9 @@ def resnet152_v1(**kwargs):
         Additional `norm_layer` arguments, for example `num_devices=4`
         for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
     """
-    return get_resnet(1, 152, use_se=False, **kwargs)
+    return get_lresnet(1, 152, use_se=False, **kwargs)
 
-def resnet18_v2(**kwargs):
+def lresnet18_v2(**kwargs):
     r"""ResNet-18 V2 model from `"Identity Mappings in Deep Residual Networks"
     <https://arxiv.org/abs/1603.05027>`_ paper.
 
@@ -698,9 +791,9 @@ def resnet18_v2(**kwargs):
         Additional `norm_layer` arguments, for example `num_devices=4`
         for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
     """
-    return get_resnet(2, 18, use_se=False, **kwargs)
+    return get_lresnet(2, 18, use_se=False, **kwargs)
 
-def resnet34_v2(**kwargs):
+def lresnet34_v2(**kwargs):
     r"""ResNet-34 V2 model from `"Identity Mappings in Deep Residual Networks"
     <https://arxiv.org/abs/1603.05027>`_ paper.
 
@@ -720,9 +813,9 @@ def resnet34_v2(**kwargs):
         Additional `norm_layer` arguments, for example `num_devices=4`
         for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
     """
-    return get_resnet(2, 34, use_se=False, **kwargs)
+    return get_lresnet(2, 34, use_se=False, **kwargs)
 
-def resnet50_v2(**kwargs):
+def lresnet50_v2(**kwargs):
     r"""ResNet-50 V2 model from `"Identity Mappings in Deep Residual Networks"
     <https://arxiv.org/abs/1603.05027>`_ paper.
 
@@ -742,9 +835,9 @@ def resnet50_v2(**kwargs):
         Additional `norm_layer` arguments, for example `num_devices=4`
         for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
     """
-    return get_resnet(2, 50, use_se=False, **kwargs)
+    return get_lresnet(2, 50, use_se=False, **kwargs)
 
-def resnet101_v2(**kwargs):
+def lresnet101_v2(**kwargs):
     r"""ResNet-101 V2 model from `"Identity Mappings in Deep Residual Networks"
     <https://arxiv.org/abs/1603.05027>`_ paper.
 
@@ -764,9 +857,9 @@ def resnet101_v2(**kwargs):
         Additional `norm_layer` arguments, for example `num_devices=4`
         for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
     """
-    return get_resnet(2, 101, use_se=False, **kwargs)
+    return get_lresnet(2, 101, use_se=False, **kwargs)
 
-def resnet152_v2(**kwargs):
+def lresnet152_v2(**kwargs):
     r"""ResNet-152 V2 model from `"Identity Mappings in Deep Residual Networks"
     <https://arxiv.org/abs/1603.05027>`_ paper.
 
@@ -786,10 +879,10 @@ def resnet152_v2(**kwargs):
         Additional `norm_layer` arguments, for example `num_devices=4`
         for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
     """
-    return get_resnet(2, 152, use_se=False, **kwargs)
+    return get_lresnet(2, 152, use_se=False, **kwargs)
 
 # SE-ResNet
-def se_resnet18_v1(**kwargs):
+def lse_resnet18_v1(**kwargs):
     r"""SE-ResNet-18 V1 model from `"Squeeze-and-Excitation Networks"
     <https://arxiv.org/abs/1709.01507>`_ paper.
 
@@ -809,9 +902,9 @@ def se_resnet18_v1(**kwargs):
         Additional `norm_layer` arguments, for example `num_devices=4`
         for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
     """
-    return get_resnet(1, 18, use_se=True, **kwargs)
+    return get_lresnet(1, 18, use_se=True, **kwargs)
 
-def se_resnet34_v1(**kwargs):
+def lse_resnet34_v1(**kwargs):
     r"""SE-ResNet-34 V1 model from `"Squeeze-and-Excitation Networks"
     <https://arxiv.org/abs/1709.01507>`_ paper.
 
@@ -831,9 +924,9 @@ def se_resnet34_v1(**kwargs):
         Additional `norm_layer` arguments, for example `num_devices=4`
         for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
     """
-    return get_resnet(1, 34, use_se=True, **kwargs)
+    return get_lresnet(1, 34, use_se=True, **kwargs)
 
-def se_resnet50_v1(**kwargs):
+def lse_resnet50_v1(**kwargs):
     r"""SE-ResNet-50 V1 model from `"Squeeze-and-Excitation Networks"
     <https://arxiv.org/abs/1709.01507>`_ paper.
 
@@ -853,9 +946,9 @@ def se_resnet50_v1(**kwargs):
         Additional `norm_layer` arguments, for example `num_devices=4`
         for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
     """
-    return get_resnet(1, 50, use_se=True, **kwargs)
+    return get_lresnet(1, 50, use_se=True, **kwargs)
 
-def se_resnet101_v1(**kwargs):
+def lse_resnet101_v1(**kwargs):
     r"""SE-ResNet-101 V1 model from `"Squeeze-and-Excitation Networks"
     <https://arxiv.org/abs/1709.01507>`_ paper.
 
@@ -875,9 +968,9 @@ def se_resnet101_v1(**kwargs):
         Additional `norm_layer` arguments, for example `num_devices=4`
         for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
     """
-    return get_resnet(1, 101, use_se=True, **kwargs)
+    return get_lresnet(1, 101, use_se=True, **kwargs)
 
-def se_resnet152_v1(**kwargs):
+def lse_resnet152_v1(**kwargs):
     r"""SE-ResNet-152 V1 model from `"Squeeze-and-Excitation Networks"
     <https://arxiv.org/abs/1709.01507>`_ paper.
 
@@ -897,9 +990,9 @@ def se_resnet152_v1(**kwargs):
         Additional `norm_layer` arguments, for example `num_devices=4`
         for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
     """
-    return get_resnet(1, 152, use_se=True, **kwargs)
+    return get_lresnet(1, 152, use_se=True, **kwargs)
 
-def se_resnet18_v2(**kwargs):
+def lse_resnet18_v2(**kwargs):
     r"""SE-ResNet-18 V2 model from `"Squeeze-and-Excitation Networks"
     <https://arxiv.org/abs/1709.01507>`_ paper.
 
@@ -919,9 +1012,9 @@ def se_resnet18_v2(**kwargs):
         Additional `norm_layer` arguments, for example `num_devices=4`
         for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
     """
-    return get_resnet(2, 18, use_se=True, **kwargs)
+    return get_lresnet(2, 18, use_se=True, **kwargs)
 
-def se_resnet34_v2(**kwargs):
+def lse_resnet34_v2(**kwargs):
     r"""SE-ResNet-34 V2 model from `"Squeeze-and-Excitation Networks"
     <https://arxiv.org/abs/1709.01507>`_ paper.
 
@@ -941,9 +1034,9 @@ def se_resnet34_v2(**kwargs):
         Additional `norm_layer` arguments, for example `num_devices=4`
         for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
     """
-    return get_resnet(2, 34, use_se=True, **kwargs)
+    return get_lresnet(2, 34, use_se=True, **kwargs)
 
-def se_resnet50_v2(**kwargs):
+def lse_resnet50_v2(**kwargs):
     r"""SE-ResNet-50 V2 model from `"Squeeze-and-Excitation Networks"
     <https://arxiv.org/abs/1709.01507>`_ paper.
 
@@ -963,9 +1056,9 @@ def se_resnet50_v2(**kwargs):
         Additional `norm_layer` arguments, for example `num_devices=4`
         for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
     """
-    return get_resnet(2, 50, use_se=True, **kwargs)
+    return get_lresnet(2, 50, use_se=True, **kwargs)
 
-def se_resnet101_v2(**kwargs):
+def lse_resnet101_v2(**kwargs):
     r"""SE-ResNet-101 V2 model from `"Squeeze-and-Excitation Networks"
     <https://arxiv.org/abs/1709.01507>`_ paper.
 
@@ -985,9 +1078,9 @@ def se_resnet101_v2(**kwargs):
         Additional `norm_layer` arguments, for example `num_devices=4`
         for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
     """
-    return get_resnet(2, 101, use_se=True, **kwargs)
+    return get_lresnet(2, 101, use_se=True, **kwargs)
 
-def se_resnet152_v2(**kwargs):
+def lse_resnet152_v2(**kwargs):
     r"""SE-ResNet-152 V2 model from `"Squeeze-and-Excitation Networks"
     <https://arxiv.org/abs/1709.01507>`_ paper.
 
@@ -1007,5 +1100,5 @@ def se_resnet152_v2(**kwargs):
         Additional `norm_layer` arguments, for example `num_devices=4`
         for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
     """
-    return get_resnet(2, 152, use_se=True, **kwargs)
+    return get_lresnet(2, 152, use_se=True, **kwargs)
 

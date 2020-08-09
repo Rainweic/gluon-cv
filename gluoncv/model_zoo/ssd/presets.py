@@ -16,6 +16,7 @@ __all__ = ['ssd_300_vgg16_atrous_voc',
            'ssd_512_resnet18_v1_coco',
            'ssd_512_resnet18_v1_custom',
            'ssd_512_resnet50_v1_voc',
+           'ssd_512_lresnet50_v1_voc',
            'ssd_512_resnet50_v1_coco',
            'ssd_512_resnet50_v1_custom',
            'ssd_512_resnet101_v2_voc',
@@ -351,6 +352,38 @@ def ssd_512_resnet50_v1_voc(pretrained=False, pretrained_base=True, **kwargs):
     """
     classes = VOCDetection.CLASSES
     return get_ssd('resnet50_v1', 512,
+                   features=['stage3_activation5', 'stage4_activation2'],
+                   filters=[512, 512, 256, 256],
+                   sizes=[51.2, 102.4, 189.4, 276.4, 363.52, 450.6, 492],
+                   ratios=[[1, 2, 0.5]] + [[1, 2, 0.5, 3, 1.0/3]] * 3 + [[1, 2, 0.5]] * 2,
+                   steps=[16, 32, 64, 128, 256, 512],
+                   classes=classes, dataset='voc', pretrained=pretrained,
+                   pretrained_base=pretrained_base, **kwargs)
+
+def ssd_512_lresnet50_v1_voc(pretrained=False, pretrained_base=False, **kwargs):
+    """SSD architecture with ResNet v1 50 layers.
+
+    Parameters
+    ----------
+    pretrained : bool or str
+        Boolean value controls whether to load the default pretrained weights for model.
+        String value represents the hashtag for a certain version of pretrained weights.
+    pretrained_base : bool or str, optional, default is True
+        Load pretrained base network, the extra layers are randomized.
+    norm_layer : object
+        Normalization layer used (default: :class:`mxnet.gluon.nn.BatchNorm`)
+        Can be :class:`mxnet.gluon.nn.BatchNorm` or :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
+    norm_kwargs : dict
+        Additional `norm_layer` arguments, for example `num_devices=4`
+        for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
+
+    Returns
+    -------
+    HybridBlock
+        A SSD detection network.
+    """
+    classes = VOCDetection.CLASSES
+    return get_ssd('lresnet50_v1', 512,
                    features=['stage3_activation5', 'stage4_activation2'],
                    filters=[512, 512, 256, 256],
                    sizes=[51.2, 102.4, 189.4, 276.4, 363.52, 450.6, 492],
