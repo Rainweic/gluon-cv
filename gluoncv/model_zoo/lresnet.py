@@ -237,7 +237,7 @@ class BottleneckV1WithInvertedResiduals(HybridBlock):
         super(BottleneckV1WithInvertedResiduals, self).__init__(**kwargs)
         self.body = nn.HybridSequential(prefix='')
         # 1x1的卷积先降维
-        up_channels = int(channels//4)
+        up_channels = int(channels//4)      # TODO 需要对比降维8倍和4倍的效果
         self.body.add(nn.Conv2D(up_channels, kernel_size=1, strides=stride))
         self.body.add(norm_layer(**({} if norm_kwargs is None else norm_kwargs)))
         self.body.add(nn.LeakyReLU(alpha=0.01))

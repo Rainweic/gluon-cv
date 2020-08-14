@@ -62,20 +62,24 @@ class YOLOOutputV3(gluon.HybridBlock):
                  alloc_size=(128, 128), **kwargs):
         super(YOLOOutputV3, self).__init__(**kwargs)
         anchors = np.array(anchors).astype('float32')
+        # 总类数目
         self._classes = num_class
-        self._num_pred = 1 + 4 + num_class  # 1 objness + 4 box + num_class
-        self._num_anchors = anchors.size // 2
+        # 1：前景或背景的置信度 4：预测的偏移量（相对于cell）num_class：目标种类数目 <-- 一个anchor对应这么多数据
+        self._num_pred = 1 + 4 + num_class
+        self._num_anchors = anchors.size // 2   # anchor数量
         self._stride = stride
         with self.name_scope():
+            # 一个feature map里头要预测的数据量
             all_pred = self._num_pred * self._num_anchors
-            self.prediction = nn.Conv2D(all_pred, kernel_size=1, padding=0, strides=1)
+            self.prediction = nn.Conv2D(all_pred, kernel_size=1, padding=0, strides=1) # 1x1卷积 输出通道为当前feature map的预测总数
             # anchors will be multiplied to predictions
-            anchors = anchors.reshape(1, 1, -1, 2)
+            anchors = anchors.reshape(1, 1, -1, 2)      # 目测是 1x1x9x2
+            # get_constant函数会先检查当前层模块的params中是否含有对应名称的权重值 没有会自动创建（有点儿像注册到静态图中的意思）
             self.anchors = self.params.get_constant('anchor_%d'%(index), anchors)
-            # offsets will be added to predictions
+            # offsets will be added to predictions 接下来会生成cell的坐标点
             grid_x = np.arange(alloc_size[1])
             grid_y = np.arange(alloc_size[0])
-            grid_x, grid_y = np.meshgrid(grid_x, grid_y)
+            grid_x, grid_y = np.meshgrid(grid_x, grid_y)    # 坐标点
             # stack to (n, n, 2)
             offsets = np.concatenate((grid_x[:, :, np.newaxis], grid_y[:, :, np.newaxis]), axis=-1)
             # expand dims to (1, 1, n, n, 2) so it's easier for broadcasting
@@ -153,19 +157,20 @@ class YOLOOutputV3(gluon.HybridBlock):
             During inference, return detections.
         """
         # prediction flat to (batch, pred per pixel, height * width)
-        pred = self.prediction(x).reshape((0, self._num_anchors * self._num_pred, -1))
-        # transpose to (batch, height * width, num_anchor, num_pred)
+        pred = self.prediction(x).reshape((0, self._num_anchors * self._num_pred, -1))      # 0为保持当前维度的数值
+        # transpose to (batch, height * width, num_anchor, num_pred)  宽x高其实就是代表了cell的数量
         pred = pred.transpose(axes=(0, 2, 1)).reshape((0, -1, self._num_anchors, self._num_pred))
-        # components
-        raw_box_centers = pred.slice_axis(axis=-1, begin=0, end=2)
-        raw_box_scales = pred.slice_axis(axis=-1, begin=2, end=4)
-        objness = pred.slice_axis(axis=-1, begin=4, end=5)
-        class_pred = pred.slice_axis(axis=-1, begin=5, end=None)
+        # components 顺序：x, y, h, w, c, obj1, obj2, ..., objn
+        raw_box_centers = pred.slice_axis(axis=-1, begin=0, end=2)  # [batch, height * width, num_anchor, 2]
+        raw_box_scales = pred.slice_axis(axis=-1, begin=2, end=4)   # [batch, height * width, num_anchor, 2]
+        objness = pred.slice_axis(axis=-1, begin=4, end=5)          # [batch, height * width, num_anchor, 1]
+        class_pred = pred.slice_axis(axis=-1, begin=5, end=None)    # [batch, height * width, num_anchor, n个类别]
 
+        # slice_like(x, y, axes=(a, b..)) 把x切割出一块和y.shape在维度a,b上一样的区域
         # valid offsets, (1, 1, height, width, 2)
-        offsets = F.slice_like(offsets, x * 0, axes=(2, 3))
+        offsets = F.slice_like(offsets, x * 0, axes=(2, 3))     # offsets是__init__中定义的，并且当前行的作用是：让self.offsets与x的参数量一致
         # reshape to (1, height*width, 1, 2)
-        offsets = offsets.reshape((1, -1, 1, 2))
+        offsets = offsets.reshape((1, -1, 1, 2))    # 让offsets与raw_box_centers一样 方便下面broadcast_add
 
         box_centers = F.broadcast_add(F.sigmoid(raw_box_centers), offsets) * self._stride
         box_scales = F.broadcast_mul(F.exp(raw_box_scales), anchors)
@@ -271,10 +276,13 @@ class YOLOV3(gluon.HybridBlock):
     norm_kwargs : dict
         Additional `norm_layer` arguments, for example `num_devices=4`
         for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
+    use_nms : bool
+        是否在计算图中使用nms算法，不使用可方便部署，nms中有的算子其他框架不支持
     """
+    # stages 其实就是backbone不同组成部分 不同部分拼接不同的分支
     def __init__(self, stages, channels, anchors, strides, classes, alloc_size=(128, 128),
                  nms_thresh=0.45, nms_topk=400, post_nms=100, pos_iou_thresh=1.0,
-                 ignore_iou_thresh=0.7, norm_layer=BatchNorm, norm_kwargs=None, **kwargs):
+                 ignore_iou_thresh=0.7, norm_layer=BatchNorm, norm_kwargs=None, use_nms=True, **kwargs):
         super(YOLOV3, self).__init__(**kwargs)
         self._classes = classes
         self.nms_thresh = nms_thresh
@@ -282,6 +290,7 @@ class YOLOV3(gluon.HybridBlock):
         self.post_nms = post_nms
         self._pos_iou_thresh = pos_iou_thresh
         self._ignore_iou_thresh = ignore_iou_thresh
+        self._use_nms = use_nms     # 是否在静态图中使用nms算法
         if pos_iou_thresh >= 1:
             self._target_generator = YOLOV3TargetMerger(len(classes), ignore_iou_thresh)
         else:
@@ -405,13 +414,15 @@ class YOLOV3(gluon.HybridBlock):
 
         # concat all detection results from different stages
         result = F.concat(*all_detections, dim=1)
+
         # apply nms per class
-        if self.nms_thresh > 0 and self.nms_thresh < 1:
+        if self.nms_thresh > 0 and self.nms_thresh < 1 and self._use_nms:
             result = F.contrib.box_nms(
                 result, overlap_thresh=self.nms_thresh, valid_thresh=0.01,
                 topk=self.nms_topk, id_index=0, score_index=1, coord_start=2, force_suppress=False)
             if self.post_nms > 0:
                 result = result.slice_axis(axis=1, begin=0, end=self.post_nms)
+
         ids = result.slice_axis(axis=-1, begin=0, end=1)
         scores = result.slice_axis(axis=-1, begin=1, end=2)
         bboxes = result.slice_axis(axis=-1, begin=2, end=None)
@@ -515,7 +526,7 @@ class YOLOV3(gluon.HybridBlock):
 
 def get_yolov3(name, stages, filters, anchors, strides, classes,
                dataset, pretrained=False, ctx=mx.cpu(),
-               root=os.path.join('~', '.mxnet', 'models'), **kwargs):
+               root=os.path.join('~', '.mxnet', 'models'), use_nms=True, **kwargs):
     """Get YOLOV3 models.
     Parameters
     ----------
@@ -566,15 +577,16 @@ def get_yolov3(name, stages, filters, anchors, strides, classes,
     HybridBlock
         A YOLOV3 detection network.
     """
-    net = YOLOV3(stages, filters, anchors, strides, classes=classes, **kwargs)
+    net = YOLOV3(stages, filters, anchors, strides, classes=classes, use_nms=use_nms, **kwargs)
     if pretrained:
         from ..model_store import get_model_file
         full_name = '_'.join(('yolo3', name, dataset))
         net.load_parameters(get_model_file(full_name, tag=pretrained, root=root), ctx=ctx)
     return net
 
+# 以yolo3-darknet53为例子进行分析学习
 def yolo3_darknet53_voc(pretrained_base=True, pretrained=False,
-                        norm_layer=BatchNorm, norm_kwargs=None, **kwargs):
+                        norm_layer=BatchNorm, norm_kwargs=None, use_nms=True, **kwargs):
     """YOLO3 multi-scale with darknet53 base network on VOC dataset.
     Parameters
     ----------
@@ -605,10 +617,10 @@ def yolo3_darknet53_voc(pretrained_base=True, pretrained=False,
     classes = VOCDetection.CLASSES
     return get_yolov3(
         'darknet53', stages, [512, 256, 128], anchors, strides, classes, 'voc',
-        pretrained=pretrained, norm_layer=norm_layer, norm_kwargs=norm_kwargs, **kwargs)
+        pretrained=pretrained, norm_layer=norm_layer, norm_kwargs=norm_kwargs, use_nms=use_nms, **kwargs)
 
 def yolo3_darknet53_coco(pretrained_base=True, pretrained=False,
-                         norm_layer=BatchNorm, norm_kwargs=None, **kwargs):
+                         norm_layer=BatchNorm, norm_kwargs=None, use_nms=True, **kwargs):
     """YOLO3 multi-scale with darknet53 base network on COCO dataset.
     Parameters
     ----------
@@ -638,10 +650,10 @@ def yolo3_darknet53_coco(pretrained_base=True, pretrained=False,
     classes = COCODetection.CLASSES
     return get_yolov3(
         'darknet53', stages, [512, 256, 128], anchors, strides, classes, 'coco',
-        pretrained=pretrained, norm_layer=norm_layer, norm_kwargs=norm_kwargs, **kwargs)
+        pretrained=pretrained, norm_layer=norm_layer, norm_kwargs=norm_kwargs, use_nms=use_nms, **kwargs)
 
 def yolo3_darknet53_custom(classes, transfer=None, pretrained_base=True, pretrained=False,
-                           norm_layer=BatchNorm, norm_kwargs=None, **kwargs):
+                           norm_layer=BatchNorm, norm_kwargs=None, use_nms=True, **kwargs):
     """YOLO3 multi-scale with darknet53 base network on custom dataset.
     Parameters
     ----------
@@ -676,16 +688,16 @@ def yolo3_darknet53_custom(classes, transfer=None, pretrained_base=True, pretrai
         strides = [8, 16, 32]
         net = get_yolov3(
             'darknet53', stages, [512, 256, 128], anchors, strides, classes, '',
-            norm_layer=norm_layer, norm_kwargs=norm_kwargs, **kwargs)
+            norm_layer=norm_layer, norm_kwargs=norm_kwargs, use_nms=use_nms, **kwargs)
     else:
         from ...model_zoo import get_model
-        net = get_model('yolo3_darknet53_' + str(transfer), pretrained=True, **kwargs)
+        net = get_model('yolo3_darknet53_' + str(transfer), pretrained=True, use_nms=use_nms, **kwargs)
         reuse_classes = [x for x in classes if x in net.classes]
         net.reset_class(classes, reuse_weights=reuse_classes)
     return net
 
 def yolo3_mobilenet1_0_voc(pretrained_base=True, pretrained=False,
-                           norm_layer=BatchNorm, norm_kwargs=None, **kwargs):
+                           norm_layer=BatchNorm, norm_kwargs=None, use_nms=True, **kwargs):
     """YOLO3 multi-scale with mobilenet base network on VOC dataset.
     Parameters
     ----------
@@ -725,10 +737,10 @@ def yolo3_mobilenet1_0_voc(pretrained_base=True, pretrained=False,
     classes = VOCDetection.CLASSES
     return get_yolov3(
         'mobilenet1.0', stages, [512, 256, 128], anchors, strides, classes, 'voc',
-        pretrained=pretrained, norm_layer=norm_layer, norm_kwargs=norm_kwargs, **kwargs)
+        pretrained=pretrained, norm_layer=norm_layer, norm_kwargs=norm_kwargs, use_nms=use_nms, **kwargs)
 
 def yolo3_mobilenet1_0_custom(classes, transfer=None, pretrained_base=True, pretrained=False,
-                              norm_layer=BatchNorm, norm_kwargs=None, **kwargs):
+                              norm_layer=BatchNorm, norm_kwargs=None, use_nms=True, **kwargs):
     """YOLO3 multi-scale with mobilenet base network on custom dataset.
     Parameters
     ----------
@@ -767,20 +779,21 @@ def yolo3_mobilenet1_0_custom(classes, transfer=None, pretrained_base=True, pret
         strides = [8, 16, 32]
         net = get_yolov3(
             'mobilenet1.0', stages, [512, 256, 128], anchors, strides, classes, '',
-            norm_layer=norm_layer, norm_kwargs=norm_kwargs, **kwargs)
+            norm_layer=norm_layer, norm_kwargs=norm_kwargs, use_nms=use_nms, **kwargs)
     else:
         from ...model_zoo import get_model
         net = get_model(
             'yolo3_mobilenet1.0_' +
             str(transfer),
             pretrained=True,
+            use_nms=use_nms,
             **kwargs)
         reuse_classes = [x for x in classes if x in net.classes]
         net.reset_class(classes, reuse_weights=reuse_classes)
     return net
 
 def yolo3_mobilenet1_0_coco(pretrained_base=True, pretrained=False, norm_layer=BatchNorm,
-                            norm_kwargs=None, **kwargs):
+                            norm_kwargs=None, use_nms=True, **kwargs):
     """YOLO3 multi-scale with mobilenet base network on COCO dataset.
     Parameters
     ----------
@@ -820,10 +833,10 @@ def yolo3_mobilenet1_0_coco(pretrained_base=True, pretrained=False, norm_layer=B
     classes = COCODetection.CLASSES
     return get_yolov3(
         'mobilenet1.0', stages, [512, 256, 128], anchors, strides, classes, 'coco',
-        pretrained=pretrained, norm_layer=norm_layer, norm_kwargs=norm_kwargs, **kwargs)
+        pretrained=pretrained, norm_layer=norm_layer, norm_kwargs=norm_kwargs, use_nms=use_nms, **kwargs)
 
 def yolo3_mobilenet0_25_voc(pretrained_base=True, pretrained=False,
-                            norm_layer=BatchNorm, norm_kwargs=None, **kwargs):
+                            norm_layer=BatchNorm, norm_kwargs=None, use_nms=True, **kwargs):
     """YOLO3 multi-scale with mobilenet0.25 base network on VOC dataset.
     Parameters
     ----------
@@ -863,10 +876,10 @@ def yolo3_mobilenet0_25_voc(pretrained_base=True, pretrained=False,
     classes = VOCDetection.CLASSES
     return get_yolov3(
         'mobilenet0.25', stages, [256, 128, 128], anchors, strides, classes, 'voc',
-        pretrained=pretrained, norm_layer=norm_layer, norm_kwargs=norm_kwargs, **kwargs)
+        pretrained=pretrained, norm_layer=norm_layer, norm_kwargs=norm_kwargs, use_nms=use_nms, **kwargs)
 
 def yolo3_mobilenet0_25_custom(classes, transfer=None, pretrained_base=True, pretrained=False,
-                               norm_layer=BatchNorm, norm_kwargs=None, **kwargs):
+                               norm_layer=BatchNorm, norm_kwargs=None, use_nms=True, **kwargs):
     """YOLO3 multi-scale with mobilenet0.25 base network on custom dataset.
     Parameters
     ----------
@@ -905,20 +918,21 @@ def yolo3_mobilenet0_25_custom(classes, transfer=None, pretrained_base=True, pre
         strides = [8, 16, 32]
         net = get_yolov3(
             'mobilenet0.25', stages, [256, 128, 128], anchors, strides, classes, '',
-            norm_layer=norm_layer, norm_kwargs=norm_kwargs, **kwargs)
+            norm_layer=norm_layer, norm_kwargs=norm_kwargs, use_nms=use_nms, **kwargs)
     else:
         from ...model_zoo import get_model
         net = get_model(
             'yolo3_mobilenet0.25_' +
             str(transfer),
             pretrained=True,
+            use_nms=use_nms,
             **kwargs)
         reuse_classes = [x for x in classes if x in net.classes]
         net.reset_class(classes, reuse_weights=reuse_classes)
     return net
 
 def yolo3_mobilenet0_25_coco(pretrained_base=True, pretrained=False, norm_layer=BatchNorm,
-                             norm_kwargs=None, **kwargs):
+                             norm_kwargs=None, use_nms=True, **kwargs):
     """YOLO3 multi-scale with mobilenet0.25 base network on COCO dataset.
     Parameters
     ----------
@@ -958,4 +972,4 @@ def yolo3_mobilenet0_25_coco(pretrained_base=True, pretrained=False, norm_layer=
     classes = COCODetection.CLASSES
     return get_yolov3(
         'mobilenet0.25', stages, [256, 128, 128], anchors, strides, classes, 'coco',
-        pretrained=pretrained, norm_layer=norm_layer, norm_kwargs=norm_kwargs, **kwargs)
+        pretrained=pretrained, norm_layer=norm_layer, norm_kwargs=norm_kwargs, use_nms=use_nms, **kwargs)
