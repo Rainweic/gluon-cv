@@ -22,34 +22,28 @@ models. This toolkit offers four main features:
 
 
 ===========================================================================
-                                  魔改说明
+                                  修改说明
 ===========================================================================
 
-现已魔改模型有：
+现已修改模型有：
 
-1. lresnet50_v1 实验暂未完成 请勿使用 <br>
-
-    魔改说明: <br>
-        将`resnet50_v1`中的瓶颈结构中的卷积修改为 深度可分离卷积 <br>
-        代码示例：`get_model("ssd_512_lresnet50_v1_voc")` <br>
-        
-    使用resnet50为backbone的模型均会涉及，例如SSD, 需要将`pretrained_base`设为`False` <br>
-    代码示例：`get_model("ssd_512_lresnet50_v1_voc")` <br>
-
-2. yolov3 <br>
+1. yolov3系列 <br>
     
     魔改说明：<br>
-        将是否使用nms模块设置为可选，**转换为openvino框架时需要使用`use_nms`参数关闭，随后自己在模型结果之后实现/使用nms** <br>
+        前传时是否使用nms模块设置为可选，通过`use_nms`参数设置, 默认为`True` <br>
+        可直接将已经训练好的params加载到当前的yolo3上，且训练时参数`use_nms`不影响效果 <br>
+        **转换为openvino框架时需要使用`use_nms`参数关闭，随后自己在模型结果之后实现/使用nms** <br>
+        `pip install nms` 即可使用现成的nms函数 <br>
         通过测试的openvino版本：2020.4.287 <br>
         通过测试的转换命令：<br>
         
-        ```python
-        python3 mo_mxnet.py --input_model yolo3-0000.params --input_shape [1,3,416,416] --data_type FP16
-        ```
+```shell script
+python3 mo_mxnet.py --input_model yolo3-0000.params --input_shape [1,3,416,416] --data_type FP16
+```
         
-        后期会将自己实现的nms算法添加进来 计划添加numpy版本、C++版本 <br>
-       
-    代码示例：`get_model("yolo3_darknet53_voc", use_nms=False)` <br>
+后期会将自己实现的nms算法添加进来 计划添加numpy版本、C++版本 <br>
+   
+代码示例：`get_model("yolo3_darknet53_voc", use_nms=False)` <br>
 
 ===========================================================================
 
